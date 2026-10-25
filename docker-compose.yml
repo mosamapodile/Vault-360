@@ -1,0 +1,13 @@
+services:
+  vault360:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      VAULT_DEMO_MODE: "true"
+      VAULT_DB: /data/vault360.sqlite3
+    volumes:
+      - vault-data:/data
+    restart: unless-stopped
+volumes:
+  vault-data:
