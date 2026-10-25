@@ -3,11 +3,11 @@
 
 [[redirects]]
   from = "/api/*"
-  to = "https://YOUR-RENDER-URL.onrender.com/api/:splat"
+  to = "https://vault360-api.onrender.com/api/:splat"
   status = 200
   force = true
 
 [[redirects]]
-  from = "/"
+  from = "/*"
   to = "/index.html"
   status = 200
