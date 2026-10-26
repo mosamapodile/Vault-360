@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +28,8 @@ def round_money(x): return round(float(x) + 1e-9, 2)
 def seed():
     with connection() as db:
         db.executescript('''
+        CREATE TABLE IF NOT EXISTS rainy_day_goals(user_id TEXT PRIMARY KEY, target REAL NOT NULL, purpose TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id));
+        CREATE TABLE IF NOT EXISTS rainy_day_entries(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, amount REAL NOT NULL, noted_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id));
         CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, pin_hash TEXT NOT NULL, salt TEXT NOT NULL, language TEXT DEFAULT 'en', accessibility INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY,user_id TEXT NOT NULL, day TEXT NOT NULL, description TEXT NOT NULL, amount REAL NOT NULL, category TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id));
         CREATE TABLE IF NOT EXISTS comprehension(user_id TEXT PRIMARY KEY,score INTEGER NOT NULL,answers TEXT NOT NULL,completed_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
@@ -444,7 +446,131 @@ def applications(u=Depends(user)):
 def audit_log(u=Depends(user)):
     with connection() as db: return [dict(r) for r in db.execute('SELECT event,details,occurred_at FROM audit WHERE user_id=? ORDER BY occurred_at DESC LIMIT 30',(u['id'],))]
 
+
+# --- Rainy Day: educational planning only; NEVER a deposit account or wallet ---
+class RainyDayGoal(BaseModel):
+    target: float = Field(ge=50,le=100000)
+    purpose: str = Field(min_length=3,max_length=80)
+
+class RainyDayEntry(BaseModel):
+    amount: float = Field(gt=0,le=100000)
+
+@app.get('/api/rainy-day')
+def rainy_day(u=Depends(user)):
+    with connection() as db:
+        goal=db.execute('SELECT target,purpose FROM rainy_day_goals WHERE user_id=?',(u['id'],)).fetchone()
+        entries=db.execute('SELECT id,amount,noted_at FROM rainy_day_entries WHERE user_id=? ORDER BY noted_at DESC',(u['id'],)).fetchall()
+        m=compute(u['id'],db)
+        saved=round_money(sum(row['amount'] for row in entries))
+        # Planner heuristic, not a command to save. Preserve essentials and never make a real transfer.
+        suggested=round_money(min(100,max(0,m['disposable_cash_velocity']*.05)))
+        return {'goal':dict(goal) if goal else None,'recorded_savings':saved,'entries':[dict(e) for e in entries],
+                'suggested_monthly_contribution':suggested,'note':'Planner only. No savings are held, transferred, or verified. Do not set aside money needed for food, rent, transport, debt payments or other essentials.'}
+
+@app.put('/api/rainy-day/goal')
+def set_rainy_day_goal(data:RainyDayGoal,u=Depends(user)):
+    with connection() as db:
+        db.execute('INSERT INTO rainy_day_goals(user_id,target,purpose,created_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET target=excluded.target,purpose=excluded.purpose',(u['id'],round_money(data.target),data.purpose.strip(),now()))
+        audit(db,u['id'],'rainy_day_goal_saved',{'target':data.target})
+    return {'message':'Savings planning goal saved. No money has moved.'}
+
+@app.post('/api/rainy-day/entries')
+def add_rainy_day_entry(data:RainyDayEntry,u=Depends(user)):
+    with connection() as db:
+        if not db.execute('SELECT 1 FROM rainy_day_goals WHERE user_id=?',(u['id'],)).fetchone(): raise HTTPException(400,'Create a goal first')
+        db.execute('INSERT INTO rainy_day_entries VALUES(?,?,?,?)',(uid(),u['id'],round_money(data.amount),now()))
+        audit(db,u['id'],'rainy_day_progress_noted',{'amount':data.amount})
+    return {'message':'Progress noted manually. Vault 360 did not receive money.'}
+
+@app.get('/api/reports/readiness.pdf')
+def readiness_pdf(u=Depends(user)):
+    # On-demand PDF generated in memory. No PDFs are stored server-side.
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.pagesizes import A4
+    from xml.sax.saxutils import escape
+    buf=io.BytesIO(); w,h=A4; doc=canvas.Canvas(buf,pagesize=A4)
+    dark=HexColor('#09282b'); teal=HexColor('#009e95'); gold=HexColor('#e5a900')
+    with connection() as db:
+        m=compute(u['id'],db)
+        q=db.execute('SELECT score FROM comprehension WHERE user_id=?',(u['id'],)).fetchone()
+    doc.setFillColor(dark);doc.rect(0,h-125,w,125,fill=1,stroke=0)
+    doc.setFillColor(gold);doc.setFont('Helvetica-Bold',13);doc.drawString(42,h-43,'VAULT 360')
+    doc.setFillColor(HexColor('#ffffff'));doc.setFont('Helvetica-Bold',19);doc.drawString(42,h-73,'Financial Readiness Snapshot')
+    doc.setFont('Helvetica',10);doc.drawString(42,h-95,'Educational assessment  |  DEMO / NOT VERIFIED')
+    doc.setFillColor(dark);doc.setFont('Helvetica-Bold',11)
+    doc.drawString(42,h-155,'Profile: '+u['name'][:72])
+    doc.setFont('Helvetica',10);doc.drawString(42,h-174,'Prepared: '+datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC'))
+    doc.drawString(42,h-190,'Assessment period: most recent 90 days (three 30-day periods)')
+    doc.setStrokeColor(teal);doc.line(42,h-209,w-42,h-209)
+    fields=[
+      ('Recorded inflows (90 days)',f"R {m['total_income']:,.2f}"),
+      ('Average monthly inflows',f"R {m['income_average']:,.2f}"),
+      ('Income volatility',f"{m['income_volatility_pct']:.1f}%"),
+      ('Transaction records analysed',str(m['transaction_count'])),
+      ('Estimated conservative monthly cash',f"R {m['disposable_cash_velocity']:,.2f}"),
+      ('Illustrative monthly repayment guardrail',f"R {m['indicative_monthly_repayment_cap']:,.2f}"),
+      ('Financial comprehension result',str(q['score'])+'%' if q else 'Not completed'),
+      ('Prototype assessment', 'Ready for an illustrative review' if m['eligible_for_demo'] else 'More documented activity needed')
+    ]
+    y=h-245
+    for i,(label,value) in enumerate(fields):
+        if i%2==0:
+            doc.setFillColor(HexColor('#edf7f6'));doc.rect(42,y-12,w-84,28,stroke=0,fill=1)
+        doc.setFillColor(dark);doc.setFont('Helvetica',9);doc.drawString(50,y,label)
+        doc.setFont('Helvetica-Bold',10);doc.drawRightString(w-50,y,value)
+        y-=32
+    y-=14
+    doc.setFillColor(teal);doc.setFont('Helvetica-Bold',11);doc.drawString(42,y,'How this snapshot is calculated')
+    y-=20
+    for line in [
+        'Transaction data is grouped into three 30-day periods.',
+        'Conservative cash estimates account for weaker income periods,',
+        'average expenses and a fixed contingency allowance.',
+        'Amounts are heuristic estimates, not verified funds or a legal affordability test.'
+    ]:
+        doc.setFillColor(dark);doc.setFont('Helvetica',9);doc.drawString(42,y,line);y-=15
+    y-=15
+    doc.setFillColor(HexColor('#fdf1cc'));doc.roundRect(42,y-78,w-84,88,9,fill=1,stroke=0)
+    doc.setFillColor(dark);doc.setFont('Helvetica-Bold',10);doc.drawString(52,y-10,'IMPORTANT — NOT A PAYSLIP OR CREDIT APPROVAL')
+    for i,line in enumerate([
+        'Vault 360 is not a lender, bank, credit bureau or document verifier.',
+        'This is an educational, self-reported/sandbox financial-readiness summary.',
+        'It is not proof of income, a certified statement, a credit score, or a loan offer.',
+        'Lenders must independently verify information, perform KYC and affordability checks.',
+    ]):
+        doc.setFont('Helvetica',8.5);doc.drawString(52,y-28-i*14,line)
+    doc.setFillColor(dark);doc.setFont('Helvetica',8);doc.drawString(42,38,'Vault 360 | Different Paydays. Real Possibilities. | Demo data only')
+    doc.showPage();doc.save();buf.seek(0)
+    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':'attachment; filename="Vault360-Readiness-Snapshot.pdf"','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'})
+
 app.mount('/assets',StaticFiles(directory=str(ROOT/'assets')),name='assets')
 app.mount('/static',StaticFiles(directory=str(ROOT/'frontend')),name='static')
 @app.get('/')
 def home(): return FileResponse(ROOT/'frontend'/'index.html')
+
+# Serve frontend assets when testing locally.
+# These routes do not interfere with existing /api endpoints.
+
+@app.get("/styles.css", include_in_schema=False)
+def local_styles():
+    return FileResponse(
+        ROOT / "frontend" / "styles.css",
+        media_type="text/css"
+    )
+
+
+@app.get("/app.js", include_in_schema=False)
+def local_javascript():
+    return FileResponse(
+        ROOT / "frontend" / "app.js",
+        media_type="application/javascript"
+    )
+
+
+@app.get("/favicon.svg", include_in_schema=False)
+def local_favicon():
+    return FileResponse(
+        ROOT / "frontend" / "favicon.svg",
+        media_type="image/svg+xml"
+    )
